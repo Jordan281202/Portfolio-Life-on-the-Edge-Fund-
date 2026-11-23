@@ -50,8 +50,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build dashboard
-        run: python build_dashboard.py
+      - name: Build dashboard (avec relances si Yahoo Finance refuse)
+        run: |
+          for i in 1 2 3 4 5; do
+            python build_dashboard.py && exit 0
+            echo "Tentative $i echouee, nouvel essai dans $((i * 20)) s..."
+            sleep $((i * 20))
+          done
+          exit 1
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
