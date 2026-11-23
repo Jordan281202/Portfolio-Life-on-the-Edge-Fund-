@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import traceback
 import warnings
 from datetime import datetime, timezone
@@ -12,6 +13,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import yfinance as yf
+
+import attribution as attr
+from content import load_content
 
 warnings.filterwarnings("ignore")
 
@@ -60,16 +64,22 @@ OUT_HTML = DOCS / "index.html"
 OUT_JSON = DATA / "dashboard_snapshot.json"
 
 CFG = {
-    "portfolio_name": "Life on the Hedge Fund",
+    "portfolio_name": "Life on the Edge Fund",
+    "manager": "Jordan",
+    "github_url": "https://github.com/Jordan281202/Portfolio-Life-on-the-Edge-Fund-",
+    "linkedin_url": "",  # add your LinkedIn profile URL here to show it in the header/footer
+    "contact_email": "",
     "school": "Trinity College Dublin",
     "school_tag": "#1 in Ireland",
     "course": "Investment Analysis · Academic Portfolio",
     "benchmark": "QQQ",
     "bench2": "SPY",
     "inception": "2025-03-06",
+    "journal_written": "2026-11-23",  # date the retrospective journal entries were written
     "rf": 0.0450,
     "af": 252,
     "roll_w": 30,
+    "alpha_w": 126,  # ~6 months window for rolling alpha
     "mc_seed": 42,
     "mc_paths": 600,
     "news_n": 10,
@@ -138,6 +148,13 @@ def _fp(x: float, d: int = 2) -> str:
     if pd.isna(x):
         return "—"
     return f"{x:+.{d}f}%"
+
+
+def _fpu(x: float, d: int = 2) -> str:
+    """Unsigned percentage, for quantities that have no direction (vol, hit ratio, weights)."""
+    if pd.isna(x):
+        return "—"
+    return f"{x:.{d}f}%"
 
 
 def _fx(x: float, d: int = 2) -> str:
@@ -248,16 +265,21 @@ def build_frame(prices: pd.DataFrame, holdings: pd.DataFrame) -> dict:
         s2ret = pd.Series(dtype=float, index=px.index)
         s2cum = pd.Series(dtype=float, index=px.index)
 
-    ret = nav.pct_change().fillna(0)
+    # Day-1 return is measured from the actual entry prices (cost basis), not from the
+    # first close, so that headline P&L, total return and position P&L all reconcile.
+    ret = nav.pct_change()
+    ret.iloc[0] = float(nav.iloc[0] / init - 1)
     bret = qqq_nav.pct_change().fillna(0)
-    cum = (1 + ret).cumprod()
+    cum = nav / init
     bcum = (1 + bret).cumprod()
 
-    dd = (nav / nav.cummax() - 1) * 100
+    peak = np.maximum(nav.cummax(), init)
+    dd = (nav / peak - 1) * 100
     bdd = (qqq_nav / qqq_nav.cummax() - 1) * 100
 
     return {
         "prices": px,
+        "init": init,
         "pos_mv": pos_mv,
         "nav": nav,
         "bench_nav": qqq_nav,
@@ -310,7 +332,8 @@ def compute_metrics(frame: dict) -> dict:
     b = frame["bret"]
     n = len(r)
 
-    tr = float(frame["nav"].iloc[-1] / frame["nav"].iloc[0] - 1)
+    init = frame["init"]
+    tr = float(frame["nav"].iloc[-1] / init - 1)
     trb = float(frame["bench_nav"].iloc[-1] / frame["bench_nav"].iloc[0] - 1)
     annr = _ann(tr, n, af)
     annb = _ann(trb, n, af)
@@ -331,7 +354,7 @@ def compute_metrics(frame: dict) -> dict:
     ir = float((act.mean() * af) / te) if te else float("nan")
 
     wealth = (1 + r).cumprod()
-    dd_s = (wealth / wealth.cummax() - 1)
+    dd_s = (wealth / np.maximum(wealth.cummax(), 1.0) - 1)
     mdd = float(dd_s.min())
     bwealth = (1 + b).cumprod()
     bmdd = float((bwealth / bwealth.cummax() - 1).min())
@@ -346,10 +369,13 @@ def compute_metrics(frame: dict) -> dict:
     upc = _capture(r, b, True)
     dnc = _capture(r, b, False)
     hit = float((r > 0).mean())
+    bsharpe = (annb - rf) / bvol if bvol else float("nan")
+    # Modigliani M²: portfolio return if it were scaled to QQQ's volatility.
+    m2 = rf + sharpe * bvol if not math.isnan(sharpe) else float("nan")
 
     dpnl = float(frame["nav"].iloc[-1] - frame["nav"].iloc[-2])
     dret = float(r.iloc[-1])
-    tpnl = float(frame["nav"].iloc[-1] - frame["nav"].iloc[0])
+    tpnl = float(frame["nav"].iloc[-1] - init)
 
     roll = CFG["roll_w"]
     rvol = r.rolling(roll).std() * math.sqrt(af) * 100
@@ -392,6 +418,8 @@ def compute_metrics(frame: dict) -> dict:
         upc=upc,
         dnc=dnc,
         hit=hit,
+        bsharpe=bsharpe,
+        m2=m2,
         sessions=n,
         rvol=rvol,
         rbeta=rbeta,
@@ -584,6 +612,30 @@ def build_forecast(frame: dict):
     return pd.DataFrame(sum_rows), pd.DataFrame(path_rows)
 
 
+NEWS_ALIASES = {
+    "GOOGL": ["alphabet", "google", "gemini", "waymo"],
+    "NVDA": ["nvidia", "jensen huang"],
+    "PLTR": ["palantir"],
+    "APP": ["applovin"],
+    "SOUN": ["soundhound"],
+    "RTX": ["rtx", "raytheon", "pratt"],
+    "RKLB": ["rocket lab", "neutron"],
+    "GEV": ["ge vernova", "vernova"],
+    "COIN": ["coinbase"],
+    "MARA": ["mara holdings", "marathon digital", "mara "],
+    "HOOD": ["robinhood"],
+    "UBER": ["uber"],
+    "RDDT": ["reddit"],
+}
+
+
+def _news_is_relevant(ticker: str, title: str) -> bool:
+    """Yahoo's feed often attaches unrelated stories to a ticker; keep only headlines that name the company."""
+    t = f" {str(title).lower()} "
+    keys = NEWS_ALIASES.get(ticker, []) + [ticker.lower()]
+    return any(re.search(rf"\b{re.escape(k.strip())}\b", t) for k in keys)
+
+
 def build_news(holdings: pd.DataFrame) -> pd.DataFrame:
     items = []
     for ticker in holdings["ticker"].tolist():
@@ -604,7 +656,7 @@ def build_news(holdings: pd.DataFrame) -> pd.DataFrame:
                 else:
                     pub = pd.NaT
 
-                if ttl and url:
+                if ttl and url and _news_is_relevant(ticker, ttl):
                     items.append(dict(
                         ticker=ticker,
                         title=ttl,
@@ -640,7 +692,10 @@ def build_intelligence(metrics: dict, pos: pd.DataFrame, structure: dict, stress
         ("Risk lens",
          f"Beta {metrics['beta']:.2f}x vs {CFG['benchmark']}, annualized vol {metrics['vol']*100:.1f}%, max drawdown {metrics['mdd']*100:.1f}%. Worst modelled shock: '{wstress['scenario']}' ({wstress['ret_impact']*100:.1f}% NAV hit)."),
         ("Benchmark lens",
-         f"Alpha vs {CFG['benchmark']}: {metrics['alpha']*100:+.1f}% since inception. Information ratio {metrics['ir']:.2f}. Upside capture {metrics['upc']:.2f}x, downside capture {metrics['dnc']:.2f}x."),
+         f"Excess return vs {CFG['benchmark']}: {metrics['alpha']*100:+.1f}% since inception, while Jensen's alpha is {metrics['jalpha']*100:+.1f}% a year: "
+         f"{'stock selection added value beyond the extra beta' if metrics['jalpha'] > 0 else 'most of the outperformance is explained by the higher beta, not by selection'}. "
+         f"Risk-adjusted (M²) the book returns {metrics['m2']*100:.1f}% vs {metrics['ann_bench']*100:.1f}% for {CFG['benchmark']}. "
+         f"Upside capture {metrics['upc']:.2f}x, downside capture {metrics['dnc']:.2f}x."),
         ("Concentration lens",
          f"Dominant sector: {dsec['sector']} at {dsec['weight']*100:.1f}% NAV. No rebalancing means winners are allowed to drift higher in weight over time."),
     ]
@@ -648,10 +703,12 @@ def build_intelligence(metrics: dict, pos: pd.DataFrame, structure: dict, stress
 
 def _layout(title: str, h: int = 360) -> dict:
     return dict(
-        title=dict(text=title, x=0.0, xanchor="left", font=dict(size=14, color=C["text"], family="DM Sans, Arial, sans-serif")),
+        # Card headers already carry the chart titles; an in-chart title would collide with the legend.
+        title=dict(text=""),
+        meta=dict(title=title),
         paper_bgcolor=C["bg"],
         plot_bgcolor=C["card"],
-        margin=dict(l=56, r=18, t=52, b=42),
+        margin=dict(l=56, r=18, t=40, b=42),
         font=dict(family="DM Sans, Arial, sans-serif", size=11, color=C["text"]),
         xaxis=dict(
             type="date",
@@ -873,6 +930,130 @@ def make_charts(frame: dict, metrics: dict, pos: pd.DataFrame, structure: dict, 
     return charts
 
 
+def build_attribution(frame: dict, metrics: dict, pos: pd.DataFrame) -> dict:
+    """Everything needed to answer: 'is the outperformance just beta?'"""
+    rf, af = CFG["rf"], CFG["af"]
+    capm = attr.capm_decomposition(metrics["ann_return"], metrics["ann_bench"], metrics["beta"], rf)
+    bm = attr.beta_matched_benchmark(frame["bret"], metrics["beta"], rf, af)
+    bm100 = (1 + bm).cumprod() * 100
+    ra = attr.rolling_alpha(frame["ret"], frame["bret"], CFG["alpha_w"], rf, af)
+    weights = pos.set_index("ticker")["weight"]
+    rc = attr.risk_contribution(frame["prices"], weights, af)
+    sel = attr.selection_vs_beta(pos, metrics["bench_total_return"], rf, metrics["sessions"], af)
+    buckets = attr.bucket_summary(pos, rc, sel)
+    share_alpha_positive = float((ra["alpha"] > 0).mean()) if not ra.empty else float("nan")
+    return dict(capm=capm, bm100=bm100, ra=ra, rc=rc, sel=sel, buckets=buckets,
+                share_alpha_positive=share_alpha_positive,
+                port_vol_rc=rc.attrs.get("port_vol"), div_ratio=rc.attrs.get("div_ratio"))
+
+
+def journal_with_stats(journal: list, frame: dict) -> list:
+    out = []
+    for e in journal:
+        e = dict(e)
+        if e.get("period_start"):
+            e["stats"] = attr.window_stats(frame["nav"], frame["bench_nav"], e["period_start"], e.get("period_end"))
+        out.append(e)
+    return out
+
+
+def make_attr_charts(frame: dict, metrics: dict, at: dict, journal: list) -> dict:
+    charts = {}
+    pc, bc, bmc = "#00D97E", "#2D7DD2", "#F0A500"
+
+    # 1. Portfolio vs QQQ vs QQQ levered to the same beta
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=_dt_list(frame["b100"].index), y=frame["b100"].tolist(), name=CFG["portfolio_name"], line=dict(color=pc, width=3)))
+    fig.add_trace(go.Scatter(x=_dt_list(at["bm100"].index), y=at["bm100"].tolist(), name=f"{CFG['benchmark']} at β={metrics['beta']:.2f}", line=dict(color=bmc, width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=_dt_list(frame["bb100"].index), y=frame["bb100"].tolist(), name=CFG["benchmark"], line=dict(color=bc, width=1.6)))
+    fig.update_layout(**_layout("Same risk, different result? Portfolio vs beta-matched QQQ", 400))
+    fig.update_yaxes(title_text="Base 100")
+    charts["beta_matched"] = fig.to_plotly_json()
+
+    # 2. CAPM decomposition of annualised return
+    c = at["capm"]
+    labels = ["Risk-free", f"Beta × market (β={metrics['beta']:.2f})", "Jensen's alpha (selection)", "Total ann. return"]
+    vals = [c["rf"] * 100, c["market"] * 100, c["alpha"] * 100, c["total"] * 100]
+    fig = go.Figure(go.Waterfall(
+        x=labels, y=vals, measure=["relative", "relative", "relative", "total"],
+        text=[f"{v:+.1f}%" for v in vals], textposition="outside",
+        increasing=dict(marker=dict(color=pc)), decreasing=dict(marker=dict(color=C["red"])),
+        totals=dict(marker=dict(color=bc)), connector=dict(line=dict(color=C["border2"], width=1)),
+    ))
+    lay = _layout("Where the annualised return comes from (CAPM)", 360)
+    lay["xaxis"] = dict(type="category", tickfont=dict(size=10, color=C["muted"]))
+    lay["hovermode"] = "closest"
+    lay["showlegend"] = False
+    fig.update_layout(**lay)
+    fig.update_yaxes(title_text="% p.a.")
+    charts["capm"] = fig.to_plotly_json()
+
+    # 3. Rolling alpha
+    ra = at["ra"]
+    if not ra.empty:
+        a = (ra["alpha"] * 100)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=_dt_list(a.index), y=a.clip(lower=0).tolist(), fill="tozeroy", fillcolor="rgba(0,217,126,0.18)", line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=_dt_list(a.index), y=a.clip(upper=0).tolist(), fill="tozeroy", fillcolor="rgba(232,48,74,0.18)", line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=_dt_list(a.index), y=a.tolist(), name=f"Rolling {CFG['alpha_w']}d Jensen's alpha", line=dict(color=C["text"], width=1.8)))
+        fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.25)", width=1))
+        fig.update_layout(**_layout(f"Rolling {CFG['alpha_w']}-day Jensen's alpha (annualised)", 360))
+        fig.update_yaxes(title_text="% p.a.")
+        charts["rolling_alpha"] = fig.to_plotly_json()
+
+    # 4. Selection vs beta P&L per position
+    sel = at["sel"].sort_values("selection_pnl")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=sel["ticker"].tolist(), x=sel["beta_pnl"].tolist(), orientation="h", name="Explained by beta", marker=dict(color="rgba(45,125,210,0.55)")))
+    fig.add_trace(go.Bar(y=sel["ticker"].tolist(), x=sel["selection_pnl"].tolist(), orientation="h", name="Stock selection", marker=dict(color=_colors(sel["selection_pnl"].tolist()))))
+    lay = _layout("P&L per position: beta vs selection", 420)
+    lay["xaxis"] = dict(tickfont=dict(size=10, color=C["muted"]), gridcolor="rgba(255,255,255,0.045)", tickprefix="$")
+    lay["yaxis"] = dict(type="category", tickfont=dict(size=10, color=C["text"], family="JetBrains Mono, monospace"))
+    lay["barmode"] = "relative"
+    lay["hovermode"] = "y unified"
+    fig.update_layout(**lay)
+    charts["selection"] = fig.to_plotly_json()
+
+    # 5. Risk contribution vs weight
+    rc = at["rc"].sort_values("risk_contrib", ascending=False)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=rc["ticker"].tolist(), y=(rc["weight"] * 100).tolist(), name="Capital weight", marker=dict(color="rgba(45,125,210,0.6)")))
+    fig.add_trace(go.Bar(x=rc["ticker"].tolist(), y=(rc["risk_contrib"] * 100).tolist(), name="Share of portfolio risk", marker=dict(color=bmc)))
+    lay = _layout("Capital weight vs contribution to volatility", 360)
+    lay["xaxis"] = dict(type="category", tickfont=dict(size=10, color=C["text"], family="JetBrains Mono, monospace"))
+    lay["barmode"] = "group"
+    lay["hovermode"] = "x unified"
+    fig.update_layout(**lay)
+    fig.update_yaxes(title_text="%", ticksuffix="%")
+    charts["risk_contrib"] = fig.to_plotly_json()
+
+    # 6. Journal markers on the main performance chart (added later to charts['perf'])
+    marks = []
+    for i, e in enumerate(sorted(journal, key=lambda x: x["date"]), start=1):
+        d = pd.Timestamp(e["date"])
+        if d < frame["b100"].index[0] or d > frame["b100"].index[-1] + pd.Timedelta(days=3):
+            continue
+        idx = frame["b100"].index.get_indexer([d], method="nearest")[0]
+        marks.append(dict(x=frame["b100"].index[idx].strftime("%Y-%m-%d"), y=float(frame["b100"].iloc[idx]), n=i, title=e.get("title", "")))
+    charts["_journal_marks"] = marks
+    return charts
+
+
+def _add_journal_marks(perf: dict, marks: list) -> dict:
+    if not marks:
+        return perf
+    perf = dict(perf)
+    layout = dict(perf.get("layout", {}))
+    anns = list(layout.get("annotations", []) or [])
+    for m in marks:
+        anns.append(dict(x=m["x"], y=m["y"], text=f"<b>{m['n']}</b>", showarrow=True, arrowhead=0, ax=0, ay=-34,
+                         arrowcolor="rgba(240,165,0,0.7)", font=dict(size=10, color="#07090F", family="JetBrains Mono, monospace"),
+                         bgcolor="#F0A500", bordercolor="#F0A500", borderpad=3, hovertext=m["title"]))
+    layout["annotations"] = anns
+    perf["layout"] = layout
+    return perf
+
+
 def _kpi(label: str, value: str, sub: str = "", tone: str = "b") -> str:
     return f"<div class='kpi {tone}'><div class='kpi-label'>{_esc(label)}</div><div class='kpi-val'>{value}</div><div class='kpi-sub'>{_esc(sub)}</div></div>"
 
@@ -904,29 +1085,30 @@ def _positions_table(pos: pd.DataFrame) -> str:
 def _metrics_table(m: dict) -> str:
     rows = [
         ("Current NAV", _fc(m["current_nav"],0), "Marked-to-market NAV."),
-        ("Total P&L", _fc(m["total_pnl"],0), "Absolute P&L since inception."),
-        ("Total Return", _fp(m["total_return"]*100), "Portfolio return since inception."),
+        ("Total P&L", _fc(m["total_pnl"],0), "NAV minus capital invested at entry prices."),
+        ("Total Return", _fp(m["total_return"]*100), "Measured on capital invested (cost basis)."),
         ("Benchmark Return", _fp(m["bench_total_return"]*100), f"{CFG['benchmark']} since inception."),
         ("Alpha vs Benchmark", _fp(m["alpha"]*100), "Simple excess return vs QQQ."),
         ("Annualized Return", _fp(m["ann_return"]*100), "Compounded annualized return."),
-        ("Annualized Volatility", _fp(m["vol"]*100), "Realized annualized vol."),
-        ("Sharpe Ratio", f"{m['sharpe']:.3f}", f"rf={CFG['rf']*100:.2f}%"),
+        ("Annualized Volatility", _fpu(m["vol"]*100), f"{CFG['benchmark']}: {_fpu(m['bvol']*100)}."),
+        ("Sharpe Ratio", f"{m['sharpe']:.3f}", f"{CFG['benchmark']}: {m['bsharpe']:.3f} · rf={CFG['rf']*100:.2f}%"),
+        ("M² (Modigliani)", _fp(m["m2"]*100), f"Return scaled to {CFG['benchmark']} vol; compare with {_fp(m['ann_bench']*100)}."),
         ("Sortino Ratio", f"{m['sortino']:.3f}", "Downside-adjusted."),
         ("Calmar Ratio", f"{m['calmar']:.3f}", "Ann. return / |max drawdown|."),
-        ("Max Drawdown", _fp(m["mdd"]*100), "Peak-to-trough drawdown."),
+        ("Max Drawdown", _fp(m["mdd"]*100), f"{CFG['benchmark']}: {_fp(m['bmdd']*100)}."),
         ("Beta", f"{m['beta']:.3f}", f"Vs {CFG['benchmark']}."),
         ("Correlation", f"{m['corr']:.3f}", f"To {CFG['benchmark']}."),
-        ("Jensen Alpha", _fp(m["jalpha"]*100), "CAPM alpha."),
-        ("Tracking Error", _fp(m["te"]*100), "Annualized active risk."),
+        ("Jensen Alpha", _fp(m["jalpha"]*100), "CAPM alpha: return above what beta alone explains."),
+        ("Tracking Error", _fpu(m["te"]*100), "Annualized active risk."),
         ("Information Ratio", f"{m['ir']:.3f}", "Active return / active risk."),
         ("VaR 95% (1d)", _fp(m["var95"]*100), "Historical 5th percentile."),
         ("CVaR 95% (1d)", _fp(m["cvar95"]*100), "Expected shortfall."),
-        ("Downside Deviation", _fp(m["ddev"]*100), "Annualized downside vol."),
+        ("Downside Deviation", _fpu(m["ddev"]*100), "Annualized downside vol."),
         ("Treynor Ratio", f"{m['treynor']:.3f}", "Excess return / beta."),
         ("Omega Ratio", f"{m['omega']:.3f}", "Gain/loss above rf threshold."),
         ("Upside Capture", _fx(m["upc"]), "On benchmark up days."),
         ("Downside Capture", _fx(m["dnc"]), "On benchmark down days."),
-        ("Hit Ratio", _fp(m["hit"]*100), "% positive days."),
+        ("Hit Ratio", _fpu(m["hit"]*100), "% positive days."),
         ("Skewness", f"{m['skew']:.3f}", "Return distribution skew."),
         ("Kurtosis", f"{m['kurt']:.3f}", "Tail fatness."),
         ("Sessions", str(m["sessions"]), "Trading days since inception."),
@@ -992,35 +1174,231 @@ def _news_table(news: pd.DataFrame) -> str:
     return "\n".join(rows)
 
 
-def generate_html(holdings, metrics, pos, structure, ledger, stress, fcast_sum, news, intel, charts) -> str:
+def _bucket_table(b: pd.DataFrame) -> str:
+    rows = []
+    for _, r in b.iterrows():
+        rows.append(
+            f"<tr><td><span class='bucket {_risk_class(r['risk_bucket'])}'>{_esc(r['risk_bucket'])}</span></td><td class='num'>{int(r['n'])}</td>"
+            f"<td class='num'>{r['weight']*100:.1f}%</td><td class='num'>{r['risk_contrib']*100:.1f}%</td>"
+            f"<td class='num' style='color:{_col(r['pnl'])}'>{_fc(r['pnl'],0)}</td>"
+            f"<td class='num' style='color:{_col(r['selection_pnl'])}'>{_fc(r['selection_pnl'],0)}</td></tr>"
+        )
+    return "\n".join(rows)
+
+
+def _attribution_text(m: dict, at: dict) -> str:
+    """Plain-English reading of the attribution numbers, regenerated at every build."""
+    c = at["capm"]
+    sel = at["sel"]
+    pos_sel = sel[sel["selection_pnl"] > 0]
+    neg_sel = sel[sel["selection_pnl"] < 0]
+    top = ", ".join(pos_sel.head(3)["ticker"]) or "none"
+    worst = ", ".join(neg_sel.sort_values("selection_pnl").head(3)["ticker"]) or "none"
+    if c["alpha"] > 0:
+        verdict = "Stock selection has added value <b>on top of</b> the extra market exposure: the fund did better than a QQQ position levered to the same beta."
+    elif m["alpha"] > 0:
+        verdict = ("Over the full period, the extra market exposure explains <b>all</b> of the outperformance: a QQQ position levered to the same beta "
+                   "would have done slightly better. The winners below show where conviction paid; the detractors show what it cost.")
+    else:
+        verdict = ("The fund trails both QQQ and a beta-matched QQQ over the full period: the high beta amplified the market's moves "
+                   "and selection did not compensate. The detractors below are where the shortfall comes from.")
+    share = at["share_alpha_positive"]
+    return (
+        f"<p>The portfolio runs a beta of <b>{m['beta']:.2f}</b> to {CFG['benchmark']}. With that much market exposure, outperforming in a rising market is expected, "
+        f"so the right test is not 'did it beat QQQ?' but 'did it beat QQQ <i>at the same risk</i>?'.</p>"
+        f"<p>CAPM splits the {c['total']*100:.1f}% annualised return into {c['rf']*100:.1f}% risk-free, {c['market']*100:+.1f}% from beta × market "
+        f"and <b>{c['alpha']*100:+.1f}%</b> of Jensen's alpha. {verdict}</p>"
+        f"<p>Selection winners (P&amp;L above what their own beta implied): <b>{_esc(top)}</b>. Main detractors: <b>{_esc(worst)}</b>. "
+        f"On a rolling {CFG['alpha_w']}-day basis, alpha was positive {share*100:.0f}% of the time. "
+        f"Risk-adjusted, M² is {m['m2']*100:.1f}% vs {m['ann_bench']*100:.1f}% for {CFG['benchmark']}, and the Sharpe ratio is {m['sharpe']:.2f} vs {m['bsharpe']:.2f}.</p>"
+    )
+
+
+def _risk_text(m: dict, at: dict, structure: dict) -> str:
+    rc = at["rc"].sort_values("risk_contrib", ascending=False)
+    top = rc.head(3)
+    top_txt = ", ".join(f"{r.ticker} {r.risk_contrib*100:.0f}% of risk for {r.weight*100:.0f}% of capital" for r in top.itertuples())
+    return (
+        f"<p>Volatility is not spread evenly: {_esc(top_txt)}. The diversification ratio is <b>{at['div_ratio']:.2f}</b> "
+        f"(weighted average stock vol ÷ portfolio vol; 1.0 would mean no diversification at all), and the book behaves like "
+        f"<b>{structure['eff_n']:.1f}</b> equally-weighted positions.</p>"
+        f"<p>Downside behaviour: max drawdown {m['mdd']*100:.1f}% vs {m['bmdd']*100:.1f}% for {CFG['benchmark']}, which is roughly what a "
+        f"{m['beta']:.1f}× beta implies. Upside capture is {m['upc']:.2f}× and downside capture {m['dnc']:.2f}×; "
+        f"the gap between the two is what makes high beta worth holding.</p>"
+    )
+
+
+def _thesis_cards(theses: list, pos: pd.DataFrame, sel: pd.DataFrame) -> str:
+    if not theses:
+        return ""
+    p = pos.set_index("ticker")
+    s = sel.set_index("ticker")
+    cards = []
+    intro = ""
+    for t in theses:
+        if t["key"] == "_intro":
+            intro = f"<div class='prose lead'>{t['html']}</div>"
+            continue
+        k = t["key"]
+        chips = ""
+        if k in p.index:
+            r = p.loc[k]
+            sp = s.loc[k, "selection_pnl"] if k in s.index else float("nan")
+            chips = (
+                f"<div class='chips'><span class='bucket {_risk_class(r['risk_bucket'])}'>{_esc(r['risk_bucket'])}</span>"
+                f"<span class='chip'>Weight {r['weight']*100:.1f}%</span>"
+                f"<span class='chip' style='color:{_col(r['ret'])}'>Return {_fp(r['ret']*100,1)}</span>"
+                f"<span class='chip'>β {r['beta']:.2f}</span>"
+                f"<span class='chip' style='color:{_col(sp)}'>Selection {_fc(sp,0)}</span></div>"
+            )
+        cards.append(f"<details class='thesis'><summary><span class='th-title'>{_esc(t['title'])}</span>{chips}</summary><div class='prose'>{t['html']}</div></details>")
+    return intro + "<div class='thesis-grid'>" + "".join(cards) + "</div>"
+
+
+def _journal_html(journal: list) -> str:
+    if not journal:
+        return ""
+    order = {e["slug"]: i for i, e in enumerate(sorted(journal, key=lambda x: x["date"]), start=1)}
+    items = []
+    for e in journal:
+        st = e.get("stats")
+        strip = ""
+        if st:
+            act = st["port_ret"] - st["bench_ret"]
+            strip = (
+                f"<div class='chips'><span class='chip'>{st['start'].strftime('%d %b %Y')} → {st['end'].strftime('%d %b %Y')}</span>"
+                f"<span class='chip' style='color:{_col(st['port_ret'])}'>Fund {_fp(st['port_ret']*100,1)}</span>"
+                f"<span class='chip' style='color:{_col(st['bench_ret'])}'>{CFG['benchmark']} {_fp(st['bench_ret']*100,1)}</span>"
+                f"<span class='chip' style='color:{_col(act)}'>Active {_fp(act*100,1)}</span>"
+                + (f"<span class='chip'>β {st['beta']:.2f}</span>" if not math.isnan(st['beta']) else "")
+                + f"<span class='chip' style='color:var(--red)'>Max DD {_fp(st['max_dd']*100,1)}</span></div>"
+            )
+        tag = _esc(e.get("tag", ""))
+        written = e.get("written", "")
+        wnote = f"<span class='written'>written {written}</span>" if written and written != e["date"] else ""
+        items.append(
+            f"<article class='jentry {tag}' id='j-{_esc(e['slug'])}'><div class='jdot'>{order[e['slug']]}</div>"
+            f"<div class='jhead'><span class='jdate'>{pd.Timestamp(e['date']).strftime('%d %b %Y')}</span><span class='jtag {tag}'>{tag}</span>{wnote}</div>"
+            f"<h3>{_esc(e.get('title',''))}</h3>{strip}<div class='prose'>{e['html']}</div></article>"
+        )
+    return "<div class='timeline'>" + "".join(items) + "</div>"
+
+
+def _sections_html(sections: list, cls: str = "prose") -> str:
+    out = []
+    for sct in sections:
+        head = f"<h3>{_esc(sct['title'])}</h3>" if sct["title"] else ""
+        out.append(f"<div class='{cls}'>{head}{sct['html']}</div>")
+    return "".join(out)
+
+
+def generate_html(holdings, metrics, pos, structure, ledger, stress, fcast_sum, news, intel, charts, at=None, content=None) -> str:
+    content = content or {"theses": [], "journal": [], "watchlist": [], "multi_asset": [], "about": []}
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     init_aum = float(holdings["cost_basis"].sum())
-    chart_json = _dumps({k: v for k, v in charts.items()})
+    chart_json = _dumps({k: v for k, v in charts.items() if not k.startswith("_")})
 
     hero = f"""
     <div id="overview" class="hero">
       <div class="hero-block"><div class="hero-label">Portfolio NAV</div><div class="hero-val green">{_fc(metrics["current_nav"],0)}</div><div class="hero-sub">from {_fc(init_aum,0)} · {metrics["sessions"]} sessions</div></div>
       <div class="hero-block"><div class="hero-label">Total P&amp;L</div><div class="hero-val {'green' if metrics['total_pnl'] >= 0 else 'red'}">{_fc(metrics["total_pnl"],0)}</div><div class="hero-sub">since {CFG["inception"]}</div></div>
-      <div class="hero-block"><div class="hero-label">Total Return</div><div class="hero-val {'green' if metrics['total_return'] >= 0 else 'red'}">{_fp(metrics["total_return"]*100)}</div><div class="hero-sub">QQQ: {_fp(metrics["bench_total_return"]*100)} · α: {_fp(metrics["alpha"]*100)}</div></div>
+      <div class="hero-block"><div class="hero-label">Total Return</div><div class="hero-val {'green' if metrics['total_return'] >= 0 else 'red'}">{_fp(metrics["total_return"]*100)}</div><div class="hero-sub">{CFG["benchmark"]}: {_fp(metrics["bench_total_return"]*100)} · excess: {_fp(metrics["alpha"]*100)}</div></div>
       <div class="hero-block"><div class="hero-label">Sharpe / Sortino</div><div class="hero-val blue">{metrics["sharpe"]:.3f}</div><div class="hero-sub">Sortino: {metrics["sortino"]:.3f} | Calmar: {metrics["calmar"]:.3f}</div></div>
       <div class="hero-right">
         <div class="hero-pill"><span class="pill-label">Beta</span><span class="pill-val" style="color:var(--amber);">{metrics["beta"]:.2f}x</span></div>
         <div class="hero-pill"><span class="pill-label">Max DD</span><span class="pill-val" style="color:var(--red);">{_fp(metrics["mdd"]*100)}</span></div>
-        <div class="hero-pill"><span class="pill-label">Vol (ann.)</span><span class="pill-val" style="color:var(--blue);">{_fp(metrics["vol"]*100)}</span></div>
-        <div class="hero-pill"><span class="pill-label">Hit Ratio</span><span class="pill-val" style="color:var(--green);">{_fp(metrics["hit"]*100)}</span></div>
+        <div class="hero-pill"><span class="pill-label">Vol (ann.)</span><span class="pill-val" style="color:var(--blue);">{_fpu(metrics["vol"]*100)}</span></div>
+        <div class="hero-pill"><span class="pill-label">Hit Ratio</span><span class="pill-val" style="color:var(--green);">{_fpu(metrics["hit"]*100)}</span></div>
       </div>
     </div>
     """
 
     kpi_grid = "".join([
         _kpi("Ann. Return", _fp(metrics["ann_return"]*100), f"QQQ: {_fp(metrics['ann_bench']*100)}", "g"),
-        _kpi("CAPM Alpha", _fp(metrics["jalpha"]*100), "Jensen's α (ann.)", "b"),
+        _kpi("Jensen's Alpha", _fp(metrics["jalpha"]*100), f"after β · M² {_fp(metrics['m2']*100,1)}", "b"),
         _kpi("Beta vs QQQ", f"{metrics['beta']:.2f}x", f"ρ={metrics['corr']:.3f}", "a"),
         _kpi("VaR 95% (1d)", _fp(metrics["var95"]*100), f"CVaR: {_fp(metrics['cvar95']*100)}", "r"),
-        _kpi("Info Ratio", f"{metrics['ir']:.3f}", f"TE: {_fp(metrics['te']*100)}", "p"),
+        _kpi("Info Ratio", f"{metrics['ir']:.3f}", f"TE: {_fpu(metrics['te']*100)}", "p"),
     ])
 
     intelligence_html = "".join(f"<div class='intel-section'><div class='intel-head'>{_esc(t)}</div><div class='intel-body'>{_esc(b)}</div></div>" for t, b in intel)
+
+    links = []
+    if CFG.get("github_url"):
+        links.append(f"<a href='{_esc(CFG['github_url'])}' target='_blank' rel='noopener'>GitHub</a>")
+    if CFG.get("linkedin_url"):
+        links.append(f"<a href='{_esc(CFG['linkedin_url'])}' target='_blank' rel='noopener'>LinkedIn</a>")
+    if CFG.get("contact_email"):
+        links.append(f"<a href='mailto:{_esc(CFG['contact_email'])}'>Contact</a>")
+    links_html = " · ".join(links)
+
+    about_html = _sections_html(content["about"])
+    attribution_block = ""
+    if at is not None:
+        attribution_block = f"""
+<div id="attribution" class="section-label"><span class="slnum">02</span> Is it just beta? — Performance attribution</div>
+<div class="row r65">
+  <div class="card"><div class="card-head"><span class="card-title">Portfolio vs QQQ levered to the same beta</span><span class="card-badge">β-matched</span></div><div class="chart-wrap" id="beta_matched"></div></div>
+  <div class="card"><div class="card-head"><span class="card-title">Reading the numbers</span><span class="card-badge">auto-updated</span></div><div class="card-body prose">{_attribution_text(metrics, at)}</div></div>
+</div>
+<div class="row r2">
+  <div class="card"><div class="card-head"><span class="card-title">CAPM decomposition</span></div><div class="chart-wrap" id="capm"></div></div>
+  <div class="card"><div class="card-head"><span class="card-title">Rolling Jensen's alpha</span><span class="card-badge">{CFG["alpha_w"]}d window</span></div><div class="chart-wrap" id="rolling_alpha"></div></div>
+</div>
+<div class="row r2">
+  <div class="card"><div class="card-head"><span class="card-title">Selection vs beta, per position</span><span class="card-badge">single-period CAPM</span></div><div class="chart-wrap" id="selection"></div></div>
+  <div class="card"><div class="card-head"><span class="card-title">Risk budget</span><span class="card-badge">ex-post covariance</span></div><div class="chart-wrap" id="risk_contrib"></div>
+    <div class="card-body prose" style="padding-top:0">{_risk_text(metrics, at, structure)}</div>
+    <div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Bucket</th><th class="num">N</th><th class="num">Capital</th><th class="num">Risk share</th><th class="num">P&amp;L</th><th class="num">Selection P&amp;L</th></tr></thead><tbody>{_bucket_table(at["buckets"])}</tbody></table></div>
+  </div>
+</div>
+"""
+
+    theses_block = ""
+    if content["theses"]:
+        theses_block = f"""
+<div id="theses" class="section-label"><span class="slnum">05</span> Investment theses</div>
+<div class="card" style="margin-bottom:16px;"><div class="card-body">{_thesis_cards(content["theses"], pos, at["sel"] if at is not None else pd.DataFrame(columns=["ticker","selection_pnl"]))}</div></div>
+"""
+
+    journal_block = ""
+    if content["journal"]:
+        journal_block = f"""
+<div id="journal" class="section-label"><span class="slnum">06</span> Portfolio journal</div>
+<div class="card" style="margin-bottom:16px;"><div class="card-body">
+  <div class="prose lead"><p>Market notes at the key moments of the portfolio's life: what happened, why the fund moved the way it did against {CFG["benchmark"]}, and what I expected next. 
+  The figures in each note (fund vs benchmark, beta, drawdown over the period) are computed automatically from the price data. Numbered markers on the performance chart point to each note.</p></div>
+  {_journal_html(content["journal"])}
+</div></div>
+"""
+
+    outlook_block = ""
+    if content["watchlist"] or content["multi_asset"]:
+        outlook_block = f"""
+<div id="outlook" class="section-label"><span class="slnum">07</span> Watchlist &amp; multi-asset view</div>
+<div class="row r2">
+  <div class="card"><div class="card-head"><span class="card-title">Watchlist — names I would add</span></div><div class="card-body">{_sections_html(content["watchlist"])}</div></div>
+  <div class="card"><div class="card-head"><span class="card-title">If this were a multi-asset portfolio</span></div><div class="card-body">{_sections_html(content["multi_asset"])}</div></div>
+</div>
+"""
+
+    methodology_block = f"""
+<div id="methodology" class="section-label"><span class="slnum">09</span> Methodology &amp; disclaimer</div>
+<div class="card" style="margin-bottom:16px;"><div class="card-body prose cols">
+<h3>Construction</h3>
+<p>Buy-and-hold book of {len(pos)} US equities opened on {CFG["inception"]} with ~{_fc(init_aum,0)} of capital at the entry prices listed in <code>holdings.csv</code>. No rebalancing, no leverage, no shorting. Benchmarks ({CFG["benchmark"]}, {CFG["bench2"]}) are bought with the same capital on the first session. Prices are daily closes from Yahoo Finance, refreshed three times per US trading day by GitHub Actions.</p>
+<h3>Returns &amp; risk</h3>
+<p>Total return and P&amp;L are measured against capital invested at entry prices. Annualisation uses {CFG["af"]} sessions and a {CFG["rf"]*100:.1f}% risk-free rate. Beta and correlation are estimated on daily returns over the full period; rolling statistics use {CFG["roll_w"]}-day windows ({CFG["alpha_w"]} days for alpha). VaR/CVaR are historical, one-day, 95%.</p>
+<h3>Attribution</h3>
+<p>Jensen's alpha = annualised return − [rf + β × (benchmark return − rf)]. The β-matched line re-levers daily {CFG["benchmark"]} excess returns by the portfolio beta. Per-position selection P&amp;L = actual P&amp;L − cost × [rf + βᵢ × ({CFG["benchmark"]} return − rf)]. Risk contribution uses current weights and the full-period covariance matrix (RCᵢ = wᵢ(Σw)ᵢ / w′Σw). M² = rf + Sharpe × σ(benchmark).</p>
+<h3>Journal</h3>
+<p>Notes dated before {CFG.get("journal_written","2026-11-23")} are a retrospective analysis written on that date with the information available at the time of each event; they are labelled "written …". Later notes are written live.</p>
+<h3>Data</h3>
+<p>Raw data: <a href="data/daily_history.csv">daily history (CSV)</a> · <a href="data/monthly_returns.csv">monthly returns (CSV)</a>.</p>
+<h3>Disclaimer</h3>
+<p>Academic, paper-traded portfolio created as a personal project. Not investment advice, not an offer of any financial product. Past performance does not predict future results.</p>
+</div></div>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1057,28 +1435,46 @@ main{{max-width:1500px;margin:0 auto;padding:24px 32px 60px}} .section-label{{fo
 .td-ticker{{font-weight:700;color:var(--text);font-size:12px}} .td-name{{color:var(--sub);font-size:10.5px;max-width:240px;overflow:hidden;text-overflow:ellipsis}}
 .intel-section{{margin-bottom:20px}} .intel-head{{font-family:var(--mono);font-size:8.5px;font-weight:700;color:var(--blue);letter-spacing:2.5px;text-transform:uppercase;padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:12px}} .intel-body{{font-size:12.5px;line-height:1.9;color:var(--text)}}
 footer{{border-top:1px solid var(--border);padding:24px 32px;display:flex;align-items:center;justify-content:space-between;max-width:1500px;margin:0 auto}} .footer-left,.footer-right{{font-family:var(--mono);font-size:10px;color:var(--dim)}}
-@media (max-width:1200px){{.hero{{grid-template-columns:1fr 1fr}}.kpi-grid{{grid-template-columns:repeat(3,1fr)}}}}
-@media (max-width:768px){{main{{padding:16px}}.topbar{{padding:0 16px}}.hero{{grid-template-columns:1fr 1fr}}.kpi-grid{{grid-template-columns:1fr 1fr}}.r2,.r3,.r65{{grid-template-columns:1fr}}}}
+.prose{{font-size:13px;line-height:1.75;color:var(--text)}} .prose p{{margin:0 0 10px}} .prose ul,.prose ol{{margin:0 0 10px 18px}} .prose li{{margin-bottom:4px}} .prose b,.prose strong{{color:#fff}}
+.prose h3{{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin:14px 0 8px}} .prose h3:first-child{{margin-top:0}} .prose h4{{font-size:12px;color:var(--amber);margin:12px 0 6px}}
+.prose code{{font-family:var(--mono);font-size:11px;background:var(--card2);padding:1px 5px;border-radius:3px}} .prose a{{color:var(--blue)}} .prose.lead{{color:var(--sub);margin-bottom:14px}} .prose.cols{{columns:2 420px;column-gap:40px}} .prose.cols h3{{break-after:avoid}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}} .chip{{font-family:var(--mono);font-size:9.5px;color:var(--sub);background:var(--card2);border:1px solid var(--border);padding:2px 8px;border-radius:3px}}
+.thesis-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}} .thesis{{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px}} .thesis summary{{cursor:pointer;list-style:none}} .thesis summary::-webkit-details-marker{{display:none}}
+.thesis summary .th-title{{font-family:var(--mono);font-size:12px;font-weight:700}} .thesis summary .th-title::before{{content:'+ ';color:var(--dim)}} .thesis[open] summary .th-title::before{{content:'– '}} .thesis .prose{{margin-top:10px;border-top:1px solid var(--border);padding-top:10px}}
+.timeline{{position:relative;margin-left:14px;border-left:1px solid var(--border2);padding-left:28px}} .jentry{{position:relative;margin-bottom:28px}} .jdot{{position:absolute;left:-43px;top:0;width:28px;height:28px;border-radius:50%;background:var(--amber);color:#07090F;font-family:var(--mono);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}}
+.jhead{{display:flex;gap:10px;align-items:center;font-family:var(--mono);font-size:10px;color:var(--sub)}} .jdate{{color:var(--text);font-weight:600}} .jtag{{text-transform:uppercase;letter-spacing:1px;font-size:8.5px;padding:1px 6px;border-radius:3px;background:var(--card2)}}
+.jtag.rally{{color:var(--green)}} .jtag.drawdown{{color:var(--red)}} .jtag.consolidation{{color:var(--amber)}} .jtag.outlook{{color:var(--cyan)}} .jtag.review{{color:var(--purple)}} .written{{color:var(--dim);font-style:italic}}
+.jentry h3{{font-size:15px;margin:6px 0 2px;font-weight:600}}
+.contact a{{color:var(--sub);text-decoration:none;font-family:var(--mono);font-size:10px}} .contact a:hover{{color:var(--text)}}
+.intro{{display:grid;grid-template-columns:1fr;gap:0;margin-bottom:16px}}
+@media (max-width:1200px){{.hero{{grid-template-columns:1fr 1fr}}.kpi-grid{{grid-template-columns:repeat(3,1fr)}}.topbar-nav a{{padding:5px 8px}}}}
+@media (max-width:900px){{.topbar{{flex-wrap:wrap;height:auto;padding:8px 16px;gap:6px}}.topbar>div:first-child{{flex-wrap:wrap;gap:8px!important;width:100%;min-width:0}}.topbar-nav{{overflow-x:auto;width:100%;min-width:0;scrollbar-width:none}}.topbar-nav a{{white-space:nowrap}}.updated{{display:none}}.thesis-grid{{grid-template-columns:1fr}}}}
+@media (max-width:768px){{main{{padding:16px}}.hero{{grid-template-columns:1fr 1fr}}.hero-block{{padding:16px}}.hero-val{{font-size:22px}}.kpi-grid{{grid-template-columns:1fr 1fr}}.r2,.r3,.r65{{grid-template-columns:1fr}}footer{{flex-direction:column;gap:8px;text-align:center}}}}
+@media (max-width:480px){{.hero{{grid-template-columns:1fr}}.hero-block{{border-right:none;border-bottom:1px solid var(--border)}}.timeline{{margin-left:6px;padding-left:20px}}.jdot{{left:-35px;width:24px;height:24px}}}}
 </style>
 </head>
 <body>
 <nav class="topbar">
   <div style="display:flex;align-items:center;gap:28px;">
-    <div class="logo">Life on the Hedge Fund <sup>Trinity College Dublin</sup></div>
+    <div class="logo">{_esc(CFG["portfolio_name"])} <sup>{_esc(CFG["school"])}</sup></div>
     <nav class="topbar-nav">
       <a href="#overview" class="active">Overview</a>
       <a href="#performance">Performance</a>
+      <a href="#attribution">Attribution</a>
       <a href="#risk">Risk</a>
       <a href="#positions">Positions</a>
-      <a href="#stress">Stress</a>
-      <a href="#intelligence">Intelligence</a>
+      <a href="#theses">Theses</a>
+      <a href="#journal">Journal</a>
+      <a href="#outlook">Outlook</a>
+      <a href="#methodology">Method</a>
     </nav>
   </div>
-  <div class="updated">Updated: {now_utc}</div>
+  <div class="updated"><span class="contact">{links_html}</span>{" · " if links_html else ""}Updated: {now_utc}</div>
 </nav>
 <main>
 {hero}
 <div class="kpi-grid">{kpi_grid}</div>
+{f'<div class="card" style="margin-bottom:16px;"><div class="card-head"><span class="card-title">About the fund</span><span class="card-badge">mandate &amp; process</span></div><div class="card-body prose cols">{about_html}</div></div>' if about_html else ''}
 
 <div id="performance" class="section-label"><span class="slnum">01</span> Performance</div>
 <div class="card" style="margin-bottom:16px;"><div class="card-head"><span class="card-title">Portfolio vs Benchmarks — Base 100 from {CFG["inception"]}</span><span class="card-badge">NAV-weighted</span></div><div class="chart-wrap" id="perf"></div></div>
@@ -1088,7 +1484,8 @@ footer{{border-top:1px solid var(--border);padding:24px 32px;display:flex;align-
   <div class="card"><div class="card-head"><span class="card-title">Monthly Returns vs {CFG["benchmark"]}</span></div><div class="chart-wrap" id="monthly_returns"></div></div>
 </div>
 
-<div id="risk" class="section-label"><span class="slnum">02</span> Risk Analytics</div>
+{attribution_block}
+<div id="risk" class="section-label"><span class="slnum">03</span> Risk Analytics</div>
 <div class="row r3">
   <div class="card"><div class="card-head"><span class="card-title">Rolling Volatility</span></div><div class="chart-wrap" id="rolling_vol"></div></div>
   <div class="card"><div class="card-head"><span class="card-title">Rolling Beta</span></div><div class="chart-wrap" id="rolling_beta"></div></div>
@@ -1100,7 +1497,7 @@ footer{{border-top:1px solid var(--border);padding:24px 32px;display:flex;align-
   <div class="card-body" style="padding:0;overflow-x:auto;"><table class="data-table"><thead><tr><th>Metric</th><th class="num">Value</th><th>Comment</th></tr></thead><tbody>{_metrics_table(metrics)}</tbody></table></div>
 </div>
 
-<div id="positions" class="section-label"><span class="slnum">03</span> Positions</div>
+<div id="positions" class="section-label"><span class="slnum">04</span> Positions</div>
 <div class="row r3">
   <div class="card"><div class="card-head"><span class="card-title">Top Weights</span></div><div class="chart-wrap" id="top_weights"></div></div>
   <div class="card"><div class="card-head"><span class="card-title">Sector Allocation</span></div><div class="chart-wrap" id="sector_alloc"></div></div>
@@ -1122,19 +1519,23 @@ footer{{border-top:1px solid var(--border);padding:24px 32px;display:flex;align-
   <div id="intelligence" class="card"><div class="card-head"><span class="card-title">Portfolio Intelligence</span></div><div class="card-body">{intelligence_html}</div></div>
 </div>
 
-<div id="stress" class="section-label"><span class="slnum">04</span> Stress & Scenario</div>
+{theses_block}
+{journal_block}
+{outlook_block}
+<div id="stress" class="section-label"><span class="slnum">08</span> Stress &amp; Scenario</div>
 <div class="row r2">
   <div class="card"><div class="card-head"><span class="card-title">Stress Tests</span></div><div class="chart-wrap" id="stress"></div><div class="card-body" style="padding-top:0;overflow-x:auto;"><table class="data-table"><thead><tr><th>Scenario</th><th>Description</th><th class="num">P&amp;L Impact</th><th class="num">Return Impact</th><th class="num">NAV After</th></tr></thead><tbody>{_stress_table(stress)}</tbody></table></div></div>
   <div class="card"><div class="card-head"><span class="card-title">12M Scenario Envelope</span></div><div class="chart-wrap" id="forecast"></div><div class="card-body" style="padding-top:0;overflow-x:auto;"><table class="data-table"><thead><tr><th>Horizon</th><th class="num">Start NAV</th><th class="num">P05</th><th class="num">P25</th><th class="num">Median</th><th class="num">P75</th><th class="num">P95</th></tr></thead><tbody>{_forecast_table(fcast_sum)}</tbody></table></div></div>
 </div>
 
-<div class="section-label"><span class="slnum">05</span> News & Monitoring</div>
+<div class="section-label"><span class="slnum">08b</span> News &amp; Monitoring</div>
 <div class="row r2">
   <div class="card"><div class="card-head"><span class="card-title">Sector Breakdown</span></div><div class="card-body" style="padding:0;overflow-x:auto;"><table class="data-table"><thead><tr><th>Sector</th><th class="num">Weight</th><th class="num">Market Value</th><th class="num">P&amp;L</th><th class="num">N</th></tr></thead><tbody>{_sector_table(structure)}</tbody></table></div></div>
   <div class="card"><div class="card-head"><span class="card-title">News Flow</span></div><div class="card-body" style="padding:0;overflow-x:auto;"><table class="data-table"><thead><tr><th>Ticker</th><th>Headline</th><th>Source</th><th>Published</th></tr></thead><tbody>{_news_table(news)}</tbody></table></div></div>
 </div>
+{methodology_block}
 </main>
-<footer><div class="footer-left">Python-generated static dashboard · GitHub Pages compatible</div><div class="footer-right">{_esc(CFG["school"])} · {_esc(CFG["portfolio_name"])}</div></footer>
+<footer><div class="footer-left">{_esc(CFG["portfolio_name"])} · managed by {_esc(CFG["manager"])} · academic paper portfolio, not investment advice</div><div class="footer-right contact">{links_html}{" · " if links_html else ""}Built with Python, pandas &amp; Plotly · auto-refreshed by GitHub Actions</div></footer>
 <script>
 const CHARTS = {chart_json};
 const CONFIG = {{ displayModeBar: false, responsive: true, scrollZoom: false }};
@@ -1186,6 +1587,8 @@ def build_snapshot(metrics: dict, pos: pd.DataFrame, structure: dict, ledger: pd
             "upc": metrics["upc"],
             "dnc": metrics["dnc"],
             "hit": metrics["hit"],
+            "bsharpe": metrics["bsharpe"],
+            "m2": metrics["m2"],
             "sessions": metrics["sessions"],
         },
         "positions": pos.to_dict(orient="records"),
@@ -1203,6 +1606,25 @@ def build_snapshot(metrics: dict, pos: pd.DataFrame, structure: dict, ledger: pd
         "news": news.to_dict(orient="records") if not news.empty else [],
         "intelligence": [{"title": t, "body": b} for t, b in intel],
     }
+
+
+def export_history(frame: dict, metrics: dict, folder: Path) -> None:
+    """Publish the daily and monthly series as CSV next to the dashboard (transparency + reuse)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    daily = pd.DataFrame({
+        "nav": frame["nav"].round(2),
+        "fund_base100": frame["b100"].round(3),
+        f"{CFG['benchmark'].lower()}_base100": frame["bb100"].round(3),
+        f"{CFG['bench2'].lower()}_base100": frame["b2b100"].round(3) if not frame["b2b100"].empty else np.nan,
+        "fund_drawdown_pct": frame["dd"].round(3),
+    })
+    daily.index.name = "date"
+    daily.to_csv(folder / "daily_history.csv")
+    monthly = pd.DataFrame({"fund_return_pct": (metrics["mp"] * 100).round(2), f"{CFG['benchmark'].lower()}_return_pct": (metrics["mb"] * 100).round(2)})
+    monthly["active_pct"] = (monthly.iloc[:, 0] - monthly.iloc[:, 1]).round(2)
+    monthly.index = monthly.index.strftime("%Y-%m")
+    monthly.index.name = "month"
+    monthly.to_csv(folder / "monthly_returns.csv")
 
 
 def main():
@@ -1223,8 +1645,17 @@ def main():
     intel = build_intelligence(metrics, pos, structure, stress)
     charts = make_charts(frame, metrics, pos, structure, heatmap, stress, fcast_paths)
 
-    html = generate_html(holdings, metrics, pos, structure, ledger, stress, fcast_sum, news, intel, charts)
+    content = load_content(ROOT)
+    content["journal"] = journal_with_stats(content["journal"], frame)
+    at = build_attribution(frame, metrics, pos)
+    extra = make_attr_charts(frame, metrics, at, content["journal"])
+    charts["perf"] = _add_journal_marks(charts["perf"], extra.pop("_journal_marks"))
+    charts.update(extra)
+
+    html = generate_html(holdings, metrics, pos, structure, ledger, stress, fcast_sum, news, intel, charts, at=at, content=content)
     OUT_HTML.write_text(html, encoding="utf-8", newline="\n")
+
+    export_history(frame, metrics, OUT_HTML.parent / "data")
 
     snapshot = build_snapshot(metrics, pos, structure, ledger, stress, fcast_sum, news, intel)
     OUT_JSON.write_text(_dumps(snapshot), encoding="utf-8", newline="\n")
@@ -1239,4 +1670,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Build failed: {exc}")
         traceback.print_exc()
-        raise
+        raise SystemExit(1)  # non-zero exit so the workflow's retry loop kicks in
