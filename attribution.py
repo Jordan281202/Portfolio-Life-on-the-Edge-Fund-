@@ -124,3 +124,33 @@ def window_stats(nav: pd.Series, bench_nav: pd.Series, start: str, end: str | No
         "beta": beta,
         "sessions": int(len(nv)),
     }
+
+
+def calendar_alpha(nav: pd.Series, bench_nav: pd.Series, init: float, rf: float, af: int = 252) -> pd.DataFrame:
+    """CAPM attribution year by year: did the fund beat QQQ *at its own beta* in each calendar year?
+
+    period alpha = fund return - [rf_period + beta_year * (QQQ return - rf_period)]
+    The first year starts from the capital invested at entry prices.
+    """
+    rows = []
+    for year in sorted(set(nav.index.year)):
+        nv = nav[nav.index.year == year]
+        bv = bench_nav[bench_nav.index.year == year]
+        if len(nv) < 10:
+            continue
+        prev_n = nav[nav.index < nv.index[0]]
+        prev_b = bench_nav[bench_nav.index < bv.index[0]]
+        start_n = float(prev_n.iloc[-1]) if len(prev_n) else float(init)
+        start_b = float(prev_b.iloc[-1]) if len(prev_b) else float(bv.iloc[0])
+        fund = float(nv.iloc[-1] / start_n - 1)
+        bench = float(bv.iloc[-1] / start_b - 1)
+        r = pd.concat([pd.Series([start_n]), nv.reset_index(drop=True)]).pct_change().dropna()
+        b = pd.concat([pd.Series([start_b]), bv.reset_index(drop=True)]).pct_change().dropna()
+        beta = float(r.cov(b) / b.var()) if b.var() else float("nan")
+        rf_p = (1 + rf) ** (len(nv) / af) - 1
+        implied = rf_p + beta * (bench - rf_p)
+        rows.append({
+            "period": f"{year}" + (" (from inception)" if not len(prev_n) else (" YTD" if year == nav.index[-1].year else "")),
+            "fund": fund, "bench": bench, "beta": beta, "implied": implied, "alpha": fund - implied,
+        })
+    return pd.DataFrame(rows)
