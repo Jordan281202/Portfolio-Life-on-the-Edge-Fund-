@@ -67,7 +67,7 @@ CFG = {
     "portfolio_name": "Life on the Edge Fund",
     "manager": "Jordan",
     "github_url": "https://github.com/Jordan281202/Portfolio-Life-on-the-Edge-Fund-",
-    "linkedin_url": "",  # add your LinkedIn profile URL here to show it in the header/footer
+    "linkedin_url": "https://www.linkedin.com/in/jordan-scouarnec-74b829218/",
     "contact_email": "",
     "school": "Trinity College Dublin",
     "school_tag": "#1 in Ireland",
@@ -693,7 +693,7 @@ def build_intelligence(metrics: dict, pos: pd.DataFrame, structure: dict, stress
          f"Beta {metrics['beta']:.2f}x vs {CFG['benchmark']}, annualized vol {metrics['vol']*100:.1f}%, max drawdown {metrics['mdd']*100:.1f}%. Worst modelled shock: '{wstress['scenario']}' ({wstress['ret_impact']*100:.1f}% NAV hit)."),
         ("Benchmark lens",
          f"Excess return vs {CFG['benchmark']}: {metrics['alpha']*100:+.1f}% since inception, while Jensen's alpha is {metrics['jalpha']*100:+.1f}% a year: "
-         f"{'stock selection added value beyond the extra beta' if metrics['jalpha'] > 0 else 'most of the outperformance is explained by the higher beta, not by selection'}. "
+         f"{'stock selection added value beyond the extra beta' if metrics['jalpha'] > 0.01 else 'most of the outperformance is explained by the higher beta, not by selection'}. "
          f"Risk-adjusted (M²) the book returns {metrics['m2']*100:.1f}% vs {metrics['ann_bench']*100:.1f}% for {CFG['benchmark']}. "
          f"Upside capture {metrics['upc']:.2f}x, downside capture {metrics['dnc']:.2f}x."),
         ("Concentration lens",
@@ -942,7 +942,8 @@ def build_attribution(frame: dict, metrics: dict, pos: pd.DataFrame) -> dict:
     sel = attr.selection_vs_beta(pos, metrics["bench_total_return"], rf, metrics["sessions"], af)
     buckets = attr.bucket_summary(pos, rc, sel)
     share_alpha_positive = float((ra["alpha"] > 0).mean()) if not ra.empty else float("nan")
-    return dict(capm=capm, bm100=bm100, ra=ra, rc=rc, sel=sel, buckets=buckets,
+    years = attr.calendar_alpha(frame["nav"], frame["bench_nav"], frame["init"], rf, af)
+    return dict(capm=capm, bm100=bm100, ra=ra, rc=rc, sel=sel, buckets=buckets, years=years,
                 share_alpha_positive=share_alpha_positive,
                 port_vol_rc=rc.attrs.get("port_vol"), div_ratio=rc.attrs.get("div_ratio"))
 
@@ -1027,7 +1028,43 @@ def make_attr_charts(frame: dict, metrics: dict, at: dict, journal: list) -> dic
     fig.update_yaxes(title_text="%", ticksuffix="%")
     charts["risk_contrib"] = fig.to_plotly_json()
 
-    # 6. Journal markers on the main performance chart (added later to charts['perf'])
+    # 6. Alpha year by year
+    yrs = at["years"]
+    if not yrs.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=yrs["period"].tolist(), y=(yrs["fund"] * 100).tolist(), name="Fund", marker=dict(color=pc)))
+        fig.add_trace(go.Bar(x=yrs["period"].tolist(), y=(yrs["bench"] * 100).tolist(), name=CFG["benchmark"], marker=dict(color=bc)))
+        fig.add_trace(go.Bar(x=yrs["period"].tolist(), y=(yrs["implied"] * 100).tolist(), name="Expected from beta", marker=dict(color="rgba(240,165,0,0.55)")))
+        fig.add_trace(go.Scatter(x=yrs["period"].tolist(), y=(yrs["alpha"] * 100).tolist(), name="Alpha (selection)", mode="markers+text",
+                                 text=[f"α {v*100:+.0f} pts" for v in yrs["alpha"]], textposition="top center",
+                                 marker=dict(size=13, symbol="diamond", color=_colors(yrs["alpha"].tolist())), textfont=dict(color=C["text"], size=11)))
+        lay = _layout("Fund vs QQQ vs beta-implied return, by year", 360)
+        lay["xaxis"] = dict(type="category", tickfont=dict(size=10, color=C["text"], family="JetBrains Mono, monospace"))
+        lay["barmode"] = "group"
+        lay["hovermode"] = "x unified"
+        fig.update_layout(**lay)
+        fig.update_yaxes(title_text="%", ticksuffix="%")
+        charts["alpha_years"] = fig.to_plotly_json()
+
+    # 7. One small chart per journal note: fund vs QQQ over the window, rebased to 100
+    for e in journal:
+        st = e.get("stats")
+        if not st:
+            continue
+        f = frame["nav"].loc[st["start"]:st["end"]]
+        q = frame["bench_nav"].loc[st["start"]:st["end"]]
+        if len(f) < 2:
+            continue
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=_dt_list(f.index), y=(f / f.iloc[0] * 100).tolist(), name="Fund", line=dict(color=pc, width=2.2)))
+        fig.add_trace(go.Scatter(x=_dt_list(q.index), y=(q / q.iloc[0] * 100).tolist(), name=CFG["benchmark"], line=dict(color=bc, width=1.6)))
+        lay = _layout("", 190)
+        lay["margin"] = dict(l=40, r=10, t=26, b=28)
+        lay["xaxis"]["tickformat"] = "%d %b"
+        fig.update_layout(**lay)
+        charts[f"jc-{e['slug']}"] = fig.to_plotly_json()
+
+    # 8. Journal markers on the main performance chart (added later to charts['perf'])
     marks = []
     for i, e in enumerate(sorted(journal, key=lambda x: x["date"]), start=1):
         d = pd.Timestamp(e["date"])
@@ -1194,11 +1231,11 @@ def _attribution_text(m: dict, at: dict) -> str:
     neg_sel = sel[sel["selection_pnl"] < 0]
     top = ", ".join(pos_sel.head(3)["ticker"]) or "none"
     worst = ", ".join(neg_sel.sort_values("selection_pnl").head(3)["ticker"]) or "none"
-    if c["alpha"] > 0:
+    if c["alpha"] > 0.01:
         verdict = "Stock selection has added value <b>on top of</b> the extra market exposure: the fund did better than a QQQ position levered to the same beta."
     elif m["alpha"] > 0:
-        verdict = ("Over the full period, the extra market exposure explains <b>all</b> of the outperformance: a QQQ position levered to the same beta "
-                   "would have done slightly better. The winners below show where conviction paid; the detractors show what it cost.")
+        verdict = ("Over the full period, the extra market exposure explains <b>essentially all</b> of the outperformance: a QQQ position levered to the same beta "
+                   "would have done about as well. The winners below show where conviction paid; the detractors show what it cost.")
     else:
         verdict = ("The fund trails both QQQ and a beta-matched QQQ over the full period: the high beta amplified the market's moves "
                    "and selection did not compensate. The detractors below are where the shortfall comes from.")
@@ -1211,6 +1248,32 @@ def _attribution_text(m: dict, at: dict) -> str:
         f"<p>Selection winners (P&amp;L above what their own beta implied): <b>{_esc(top)}</b>. Main detractors: <b>{_esc(worst)}</b>. "
         f"On a rolling {CFG['alpha_w']}-day basis, alpha was positive {share*100:.0f}% of the time. "
         f"Risk-adjusted, M² is {m['m2']*100:.1f}% vs {m['ann_bench']*100:.1f}% for {CFG['benchmark']}, and the Sharpe ratio is {m['sharpe']:.2f} vs {m['bsharpe']:.2f}.</p>"
+    )
+
+
+def _years_table(y: pd.DataFrame) -> str:
+    rows = []
+    for _, r in y.iterrows():
+        rows.append(
+            f"<tr><td>{_esc(r['period'])}</td><td class='num' style='color:{_col(r['fund'])}'>{_fp(r['fund']*100,1)}</td>"
+            f"<td class='num' style='color:{_col(r['bench'])}'>{_fp(r['bench']*100,1)}</td><td class='num'>{r['beta']:.2f}</td>"
+            f"<td class='num'>{_fp(r['implied']*100,1)}</td><td class='num' style='color:{_col(r['alpha'])}'><b>{_fp(r['alpha']*100,1)}</b></td></tr>"
+        )
+    return "\n".join(rows)
+
+
+def _years_text(y: pd.DataFrame) -> str:
+    if y.empty:
+        return ""
+    best = y.loc[y["alpha"].idxmax()]
+    worst = y.loc[y["alpha"].idxmin()]
+    return (
+        f"<p>The full-period alpha hides two very different regimes. In <b>{_esc(best['period'])}</b> the fund returned {best['fund']*100:+.0f}% "
+        f"when its beta of {best['beta']:.2f} implied {best['implied']*100:+.0f}%: <b>{best['alpha']*100:+.0f} points of selection alpha</b>. "
+        + (f"In <b>{_esc(worst['period'])}</b> the same convictions, held without rebalancing, gave back {worst['alpha']*100:+.0f} points as the speculative sleeve "
+           f"and the high-beta momentum factor unwound.</p>" if worst["alpha"] < 0 and len(y) > 1 else "</p>")
+        + f"<p>Context matters for reading this: the book was built in February 2025 as an equity-only, simulated portfolio with a deliberately high beta, "
+        f"and it has never been rebalanced. Every result here comes from the initial decisions, including letting the 2025 winners grow into the 2026 drawdowns.</p>"
     )
 
 
@@ -1279,7 +1342,9 @@ def _journal_html(journal: list) -> str:
         items.append(
             f"<article class='jentry {tag}' id='j-{_esc(e['slug'])}'><div class='jdot'>{order[e['slug']]}</div>"
             f"<div class='jhead'><span class='jdate'>{pd.Timestamp(e['date']).strftime('%d %b %Y')}</span><span class='jtag {tag}'>{tag}</span>{wnote}</div>"
-            f"<h3>{_esc(e.get('title',''))}</h3>{strip}<div class='prose'>{e['html']}</div></article>"
+            f"<h3>{_esc(e.get('title',''))}</h3>{strip}"
+            + (f"<div class='jchart' id='jc-{_esc(e['slug'])}'></div>" if st else "")
+            + f"<div class='prose'>{e['html']}</div></article>"
         )
     return "<div class='timeline'>" + "".join(items) + "</div>"
 
@@ -1344,6 +1409,12 @@ def generate_html(holdings, metrics, pos, structure, ledger, stress, fcast_sum, 
 <div class="row r2">
   <div class="card"><div class="card-head"><span class="card-title">CAPM decomposition</span></div><div class="chart-wrap" id="capm"></div></div>
   <div class="card"><div class="card-head"><span class="card-title">Rolling Jensen's alpha</span><span class="card-badge">{CFG["alpha_w"]}d window</span></div><div class="chart-wrap" id="rolling_alpha"></div></div>
+</div>
+<div class="row r65">
+  <div class="card"><div class="card-head"><span class="card-title">Alpha year by year</span><span class="card-badge">CAPM per calendar year</span></div><div class="chart-wrap" id="alpha_years"></div></div>
+  <div class="card"><div class="card-head"><span class="card-title">Two regimes</span></div><div class="card-body prose">{_years_text(at["years"])}</div>
+    <div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Period</th><th class="num">Fund</th><th class="num">{CFG["benchmark"]}</th><th class="num">β</th><th class="num">Beta-implied</th><th class="num">Alpha</th></tr></thead><tbody>{_years_table(at["years"])}</tbody></table></div>
+  </div>
 </div>
 <div class="row r2">
   <div class="card"><div class="card-head"><span class="card-title">Selection vs beta, per position</span><span class="card-badge">single-period CAPM</span></div><div class="chart-wrap" id="selection"></div></div>
@@ -1444,7 +1515,7 @@ footer{{border-top:1px solid var(--border);padding:24px 32px;display:flex;align-
 .timeline{{position:relative;margin-left:14px;border-left:1px solid var(--border2);padding-left:28px}} .jentry{{position:relative;margin-bottom:28px}} .jdot{{position:absolute;left:-43px;top:0;width:28px;height:28px;border-radius:50%;background:var(--amber);color:#07090F;font-family:var(--mono);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}}
 .jhead{{display:flex;gap:10px;align-items:center;font-family:var(--mono);font-size:10px;color:var(--sub)}} .jdate{{color:var(--text);font-weight:600}} .jtag{{text-transform:uppercase;letter-spacing:1px;font-size:8.5px;padding:1px 6px;border-radius:3px;background:var(--card2)}}
 .jtag.rally{{color:var(--green)}} .jtag.drawdown{{color:var(--red)}} .jtag.consolidation{{color:var(--amber)}} .jtag.outlook{{color:var(--cyan)}} .jtag.review{{color:var(--purple)}} .written{{color:var(--dim);font-style:italic}}
-.jentry h3{{font-size:15px;margin:6px 0 2px;font-weight:600}}
+.jentry h3{{font-size:15px;margin:6px 0 2px;font-weight:600}} .jchart{{max-width:560px;margin:4px 0 10px;border:1px solid var(--border);border-radius:6px;overflow:hidden}}
 .contact a{{color:var(--sub);text-decoration:none;font-family:var(--mono);font-size:10px}} .contact a:hover{{color:var(--text)}}
 .intro{{display:grid;grid-template-columns:1fr;gap:0;margin-bottom:16px}}
 @media (max-width:1200px){{.hero{{grid-template-columns:1fr 1fr}}.kpi-grid{{grid-template-columns:repeat(3,1fr)}}.topbar-nav a{{padding:5px 8px}}}}
